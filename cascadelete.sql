@@ -79,7 +79,7 @@ CREATE OR REPLACE PROCEDURE CASCADELETE(table_name VARCHAR2, where_clause VARCHA
       WHERE RUC.TABLE_NAME = parent
         AND NOT (UT.IOT_TYPE IS NOT NULL AND UC.CONSTRAINT_TYPE = 'P')
         AND UC.CONSTRAINT_NAME NOT LIKE 'SYS%'
-        AND UC.STATUS = 'ENABLED'       -- comment this line out if you want to include DISABLED constraints
+        AND UC.STATUS = 'ENABLED'       -- comment out this line if you want to include DISABLED constraints
         AND ancestor IS NOT NULL
       UNION ALL
       SELECT NULL, parent, NULL
@@ -105,34 +105,35 @@ CREATE OR REPLACE PROCEDURE CASCADELETE(table_name VARCHAR2, where_clause VARCHA
           query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || where_clause;
           fk := child_pk;
         END IF;
-        IF log = 'Y' THEN
-          DBMS_OUTPUT.PUT_LINE(INDENT || CASE WHEN ANCESTOR IS NULL THEN 'NULL' ELSE parent END || '  -->  ' || child.table_name);
-          DBMS_OUTPUT.PUT_LINE(INDENT || 'QUERY: ' || query);
-        END IF;
         wrapped_query := 'SELECT * FROM (' || query || ') WHERE ROWNUM <= ' || batch_size;
         EXECUTE IMMEDIATE wrapped_query BULK COLLECT INTO result;
         IF result.count = 0 THEN
           IF log = 'Y' THEN
-            DBMS_OUTPUT.PUT_LINE(indent || 'RESULT: NULL, continue ...');
+            DBMS_OUTPUT.PUT_LINE(indent || '+- (' || CASE WHEN ANCESTOR IS NULL THEN 'NULL' ELSE parent END ||
+                                 '  ->  ' || child.table_name || ' - no child record found, continue;)');
           END IF;
           CONTINUE;
         END IF;
-        parts := ceil(COUNT_OF_RECORDS(child.table_name, fk, pk_values) / batch_size);
+        IF log = 'Y' THEN
+          DBMS_OUTPUT.PUT_LINE(indent || '+- ' || CASE WHEN ANCESTOR IS NULL THEN 'NULL' ELSE parent END || '  ->  ' || child.table_name);
+          DBMS_OUTPUT.PUT_LINE(indent || '*  sql> ' || query);
+        END IF;
+        parts := ceil(COUNT_OF_RECORDS(child.table_name, fk, nvl(pk_values, TO_CSV(result, child.table_name, child_pk))) / batch_size);
         counter := 1;
         WHILE result.count > 0 LOOP
           csv := TO_CSV(result, child.table_name, child_pk);
           IF log = 'Y' THEN
-            DBMS_OUTPUT.PUT_LINE(indent || 'RESULT (part ' || counter || '/' || parts || '): ' || csv);
+            DBMS_OUTPUT.PUT_LINE(indent || '*  result (part ' || counter || '/' || parts || '): ' || csv);
           END IF;
-          RECURSIVE_DELETE(parent, child.table_name, child_pk, csv, indent || '      ');
+          RECURSIVE_DELETE(parent, child.table_name, child_pk, csv, indent || '|    ');
           EXECUTE IMMEDIATE wrapped_query BULK COLLECT INTO result;
           counter := counter + 1;
         END LOOP;
       END LOOP;
       IF ancestor IS NULL THEN RETURN; END IF; -- ignore dummy root, there is nothing to delete
-      delete_query := 'DELETE FROM ' || parent || ' WHERE ' || nvl(pk, child_pk) || ' IN (' || pk_values || ')';
+      delete_query := 'DELETE ' || parent || ' WHERE ' || nvl(pk, child_pk) || ' IN (' || pk_values || ')';
       IF log = 'Y' THEN
-        DBMS_OUTPUT.PUT_LINE(indent || delete_query);
+        DBMS_OUTPUT.PUT_LINE(substr(indent, 1, length(indent) - 5) || '*  ' || delete_query);
       END IF;
       EXECUTE IMMEDIATE delete_query;
     END RECURSIVE_DELETE;
@@ -142,9 +143,14 @@ CREATE OR REPLACE PROCEDURE CASCADELETE(table_name VARCHAR2, where_clause VARCHA
     IF (input_batch_size IS NULL OR input_batch_size < 1 OR input_batch_size > 1000) THEN
       batch_size := 1000;
     END IF;
+    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
+    DBMS_OUTPUT.PUT_LINE('CASCADELETE ' || table_name || ' WHERE ' || where_clause);
+    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
     RECURSIVE_DELETE(NULL, table_name, NULL, NULL, NULL, where_clause);
     IF log = 'Y' THEN
-      DBMS_OUTPUT.PUT_LINE('DONE!');
+      DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
+      DBMS_OUTPUT.PUT_LINE('                          DONE!');
+      DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
     END IF;
   END CASCADELETE;
 /
