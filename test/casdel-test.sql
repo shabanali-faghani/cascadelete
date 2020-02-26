@@ -9,12 +9,3 @@ END;
 -- on HR user
 -- test "composite primary key" error
 CALL CASCADELETE('JOBS', 'JOB_TITLE = ''President''');
-
--- debugging
-SELECT *
-FROM all_errors;
-
-SELECT *
-FROM all_errors
-WHERE name IN ('CASCADELETE', 'RECURSIVE_DELETE')
-ORDER BY name, sequence;

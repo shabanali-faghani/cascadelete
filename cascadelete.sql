@@ -1,76 +1,79 @@
-CREATE OR REPLACE PROCEDURE CASCADELETE(table_name VARCHAR2, where_clause VARCHAR2, log CHAR DEFAULT 'Y', input_batch_size NUMBER DEFAULT 1000) AS
-  -- any character except for 'Y' like 'N' turns logging off
-  -- the valid maximum number of items in an IN sql statement is 1000
+create or replace procedure cascadelete(table_name varchar2, where_clause varchar2, logging boolean default true,
+  input_batch_size number default 1000) as
 
-  TYPE VAR_TABLE IS TABLE OF VARCHAR2(32767);
+  type var_table is table of varchar2(32767);
+  batch_size number(4) := input_batch_size;
+  cascadelete_query varchar2(32767);
 
-  batch_size NUMBER(4) := input_batch_size;
+  function primary_key(table_name varchar2) return varchar2 as
+    result var_table;
+    ex_custom exception;
+  begin
+    execute immediate 'SELECT COLS.COLUMN_NAME
+      FROM USER_CONSTRAINTS CONS, USER_CONS_COLUMNS COLS
+      WHERE COLS.TABLE_NAME = ''' || table_name || '''
+        AND CONS.CONSTRAINT_TYPE = ''P''
+        AND CONS.CONSTRAINT_NAME = COLS.CONSTRAINT_NAME
+        AND CONS.STATUS = ''ENABLED''
+      ORDER BY COLS.POSITION'
+        bulk collect into result;
+    if result.count = 1 then
+      return result(1);
+    end if;
+    rollback;     -- rollback all executed deletes, if any
+    if result.count = 0 then
+      raise_application_error(-20001, 'The table ' || table_name || ' has not primary key');
+    elsif result.count > 1 then
+      raise_application_error(-20001, 'The table ' || table_name || ' has a composite primary key');
+    end if;
+    exception when ex_custom then dbms_output.put_line(sqlerrm);
+  end primary_key;
 
-  FUNCTION PRIMARY_KEY(table_name VARCHAR2) RETURN VARCHAR2 AS
-    result VAR_TABLE;
-      ex_custom EXCEPTION;
-    BEGIN
-      EXECUTE IMMEDIATE 'SELECT COLS.COLUMN_NAME
-        FROM USER_CONSTRAINTS CONS, USER_CONS_COLUMNS COLS
-        WHERE COLS.TABLE_NAME = ''' || table_name || '''
-          AND CONS.CONSTRAINT_TYPE = ''P''
-          AND CONS.CONSTRAINT_NAME = COLS.CONSTRAINT_NAME
-          AND CONS.STATUS = ''ENABLED''
-        ORDER BY COLS.POSITION'
-      BULK COLLECT INTO result;
-      IF result.count = 1 THEN
-        RETURN result(1);
-      END IF;
-      ROLLBACK;     -- rollback all executed deletes, if any
-      IF result.count = 0 THEN
-        RAISE_APPLICATION_ERROR(-20001, 'The table ' || TABLE_NAME || ' has not primary key');
-      ELSIF result.count > 1 THEN
-        RAISE_APPLICATION_ERROR(-20001, 'The table ' || TABLE_NAME || ' has a composite primary key');
-      END IF;
-      EXCEPTION
-      WHEN ex_custom
-      THEN DBMS_OUTPUT.PUT_LINE(sqlerrm);
-    END PRIMARY_KEY;
+  function number_of_records(table_name varchar2, column_name varchar2, parent_pk_values varchar2) return number is
+    result var_table;
+  begin
+    if parent_pk_values is null then
+      return 0;
+    end if;
+    execute immediate 'SELECT count(1) FROM ' || table_name || ' WHERE ' || column_name || ' IN (' || parent_pk_values || ')' bulk collect into result;
+    return result(1);
+  end number_of_records;
 
+  function column_type(table_name varchar2, column_name varchar2) return varchar2 is
+    result var_table;
+  begin
+    execute immediate 'SELECT DATA_TYPE
+      FROM USER_TAB_COLUMNS
+      WHERE upper(TABLE_NAME) = upper(''' || table_name || ''') AND upper(COLUMN_NAME) = upper(''' || column_name || ''')'
+        bulk collect into result;
+    return result(1);
+  end column_type;
 
-  FUNCTION COUNT_OF_RECORDS(table_name VARCHAR2, column_name VARCHAR2, parent_pk_values VARCHAR2) RETURN NUMBER IS
-    result VAR_TABLE;
-    BEGIN
-      IF parent_pk_values IS NULL THEN
-        RETURN 0;
-      END IF;
-      EXECUTE IMMEDIATE 'SELECT count(1) FROM ' || table_name || ' WHERE ' || column_name || ' IN (' || parent_pk_values || ')' BULK COLLECT INTO result;
-      RETURN result(1);
-    END;
+  function to_csv(list var_table, table_name varchar2, pk varchar2) return varchar2 is
+    column_data_type varchar2(10);
+    csv              varchar2(32767);
+    single_quote     char(1);
+  begin
+    column_data_type := column_type(table_name, pk);
+    if instr(upper(column_data_type), 'CHAR') <> 0 then -- CHAR, VARCHAR, VARCHAR2, NCHAR, NVARCHAR2
+      single_quote := '''';
+    end if;
+    for i in 1..list.count loop
+      csv := csv || single_quote || list(i) || single_quote || ', ';
+    end loop;
+    return substr(csv, 1, length(csv) - 2);
+  end to_csv;
 
-  FUNCTION COLUMN_TYPE(table_name VARCHAR2, column_name VARCHAR2) RETURN VARCHAR2 IS
-    result VAR_TABLE;
-    BEGIN
-      EXECUTE IMMEDIATE 'SELECT DATA_TYPE
-         FROM USER_TAB_COLUMNS
-         WHERE upper(TABLE_NAME) = upper(''' || table_name || ''') AND upper(COLUMN_NAME) = upper(''' || column_name || ''')'
-      BULK COLLECT INTO result;
-      RETURN result(1);
-    END COLUMN_TYPE;
+  procedure log(message varchar2) is
+  begin
+    if logging then
+      dbms_output.put_line(message);
+    end if;
+  end log;
 
-  FUNCTION TO_CSV(list VAR_TABLE, table_name VARCHAR2, pk VARCHAR2) RETURN VARCHAR2 IS
-    column_data_type VARCHAR2(10);
-    csv              VARCHAR2(32767);
-    single_quote     CHAR(1);
-    BEGIN
-      column_data_type := COLUMN_TYPE(table_name, pk);
-      IF instr(upper(column_data_type), 'CHAR') <> 0 THEN -- CHAR, VARCHAR, VARCHAR2, NCHAR, NVARCHAR2
-        single_quote := '''';
-      END IF;
-      FOR i IN 1..list.count LOOP
-        csv := csv || single_quote || list(i) || single_quote || ', ';
-      END LOOP;
-      RETURN substr(csv, 1, length(csv) - 2);
-    END TO_CSV;
-
-  PROCEDURE RECURSIVE_DELETE(ancestor VARCHAR2, parent VARCHAR2, pk VARCHAR2, pk_values VARCHAR2, indent VARCHAR2, where_clause VARCHAR2 DEFAULT NULL) IS
-
-    CURSOR CHILDS (ancestor VARCHAR2, parent VARCHAR2) IS
+  procedure recursive_delete(ancestor varchar2, parent varchar2, pk varchar2, pk_values varchar2, indent varchar2,
+    where_clause varchar2 default null) is
+    cursor childs (ancestor varchar2, parent varchar2) is
       SELECT UC.CONSTRAINT_NAME, UC.TABLE_NAME, UCC.COLUMN_NAME AS FOREIGN_KEY
       FROM USER_TABLES UT
         INNER JOIN USER_CONSTRAINTS UC ON UT.TABLE_NAME = UC.TABLE_NAME
@@ -79,78 +82,73 @@ CREATE OR REPLACE PROCEDURE CASCADELETE(table_name VARCHAR2, where_clause VARCHA
       WHERE RUC.TABLE_NAME = parent
         AND NOT (UT.IOT_TYPE IS NOT NULL AND UC.CONSTRAINT_TYPE = 'P')
         AND UC.CONSTRAINT_NAME NOT LIKE 'SYS%'
-        AND UC.STATUS = 'ENABLED'       -- comment out this line if you want to include DISABLED constraints
+        AND UC.STATUS = 'ENABLED' -- comment out this line if you want to delete records related by DISABLED constraints, too.
         AND ancestor IS NOT NULL
       UNION ALL
       SELECT NULL, parent, NULL
       FROM DUAL
       WHERE ancestor IS NULL;
 
-    query         VARCHAR2(32700);
-    child_pk      VARCHAR2(30);
-    fk            VARCHAR2(30);
-    wrapped_query VARCHAR2(32767);
-    result        VAR_TABLE;
-    csv           VARCHAR2(32767);
-    parts         NUMBER(9) := 0;
-    counter       NUMBER(9);
-    delete_query  VARCHAR2(32767);
-
-    BEGIN
-      FOR child IN CHILDS(ancestor, parent) LOOP
-        child_pk := PRIMARY_KEY(child.table_name);
-        fk := child.foreign_key;
-        query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || child.foreign_key || ' IN (' || pk_values || ')';
-        IF ancestor IS NULL THEN    -- case dummy root
-          query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || where_clause;
-          fk := child_pk;
-        END IF;
-        wrapped_query := 'SELECT * FROM (' || query || ') WHERE ROWNUM <= ' || batch_size;
-        EXECUTE IMMEDIATE wrapped_query BULK COLLECT INTO result;
-        IF result.count = 0 THEN
-          IF log = 'Y' THEN
-            DBMS_OUTPUT.PUT_LINE(indent || '+- (' || CASE WHEN ANCESTOR IS NULL THEN 'NULL' ELSE parent END ||
-                                 '  ->  ' || child.table_name || ' - no child record found, continue;)');
-          END IF;
-          CONTINUE;
-        END IF;
-        IF log = 'Y' THEN
-          DBMS_OUTPUT.PUT_LINE(indent || '+- ' || CASE WHEN ANCESTOR IS NULL THEN 'NULL' ELSE parent END || '  ->  ' || child.table_name);
-          DBMS_OUTPUT.PUT_LINE(indent || '*  sql> ' || query);
-        END IF;
-        parts := ceil(COUNT_OF_RECORDS(child.table_name, fk, nvl(pk_values, TO_CSV(result, child.table_name, child_pk))) / batch_size);
-        counter := 1;
-        WHILE result.count > 0 LOOP
-          csv := TO_CSV(result, child.table_name, child_pk);
-          IF log = 'Y' THEN
-            DBMS_OUTPUT.PUT_LINE(indent || '*  result (part ' || counter || '/' || parts || '): ' || csv);
-          END IF;
-          RECURSIVE_DELETE(parent, child.table_name, child_pk, csv, indent || '|    ');
-          EXECUTE IMMEDIATE wrapped_query BULK COLLECT INTO result;
-          counter := counter + 1;
-        END LOOP;
-      END LOOP;
-      IF ancestor IS NULL THEN RETURN; END IF; -- ignore dummy root, there is nothing to delete
-      delete_query := 'DELETE ' || parent || ' WHERE ' || nvl(pk, child_pk) || ' IN (' || pk_values || ')';
-      IF log = 'Y' THEN
-        DBMS_OUTPUT.PUT_LINE(substr(indent, 1, length(indent) - 5) || '*  ' || delete_query);
-      END IF;
-      EXECUTE IMMEDIATE delete_query;
-    END RECURSIVE_DELETE;
+    query         varchar2(32700);
+    child_pk      varchar2(30);
+    fk            varchar2(30);
+    wrapped_query varchar2(32767);
+    result        var_table;
+    csv           varchar2(32767);
+    parts         number(9) := 0;
+    counter       number(9);
+    delete_query  varchar2(32767);
 
   BEGIN
-    DBMS_OUTPUT.ENABLE(NULL); -- unlimited buffer
-    IF (input_batch_size IS NULL OR input_batch_size < 1 OR input_batch_size > 1000) THEN
-      batch_size := 1000;
-    END IF;
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-    DBMS_OUTPUT.PUT_LINE('CASCADELETE ' || table_name || ' WHERE ' || where_clause);
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-    RECURSIVE_DELETE(NULL, table_name, NULL, NULL, NULL, where_clause);
-    IF log = 'Y' THEN
-      DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-      DBMS_OUTPUT.PUT_LINE('                          DONE!');
-      DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-    END IF;
-  END CASCADELETE;
+    for child in childs(ancestor, parent) loop
+      child_pk := primary_key(child.table_name);
+      fk := child.foreign_key;
+      query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || child.foreign_key || ' IN (' || pk_values || ')';
+      if ancestor is null then    -- case dummy root
+        query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || where_clause;
+        fk := child_pk;
+      end if;
+      wrapped_query := 'SELECT * FROM (' || query || ') WHERE ROWNUM <= ' || batch_size;
+      execute immediate wrapped_query bulk collect into result;
+      log(indent || '+- ' || case when ancestor is null then 'ROOT' else parent end || '  ->  ' || child.table_name);
+      if result.count = 0 then
+        continue;
+      end if;
+      log(indent || '*  sql> ' || query || ';');
+      parts := ceil(number_of_records(child.table_name, fk, nvl(pk_values,
+        to_csv(result, child.table_name, child_pk))) / batch_size);
+      counter := 1;
+      while result.count > 0 loop
+        csv := to_csv(result, child.table_name, child_pk);
+        log(indent || '*  result (part ' || counter || '/' || parts || '): ' || csv);
+        recursive_delete(parent, child.table_name, child_pk, csv, indent || '|    ');
+        execute immediate wrapped_query bulk collect into result;
+        counter := counter + 1;
+      end loop;
+    end loop;
+    if ancestor is null then return; end if; -- ignore dummy root, there is nothing to delete
+    delete_query := 'DELETE ' || parent || ' WHERE ' || nvl(pk, child_pk) || ' IN (' || pk_values || ')';
+    log(substr(indent, 1, length(indent) - 5) || '*  sql> ' || delete_query || ';');
+    execute immediate delete_query;
+  end recursive_delete;
+
+  procedure do_dash(num number) is
+    dashes varchar2(32767);
+  begin
+    for i in 1..num loop
+      dashes := dashes || '-';
+    end loop;
+    log(dashes);
+  end do_dash;
+begin
+  dbms_output.enable(null); -- unlimited buffer
+  if (input_batch_size is null or input_batch_size < 1 or input_batch_size > 1000) then
+    batch_size := 1000;
+  end if;
+  cascadelete_query := 'SQL> CASCADELETE ' || table_name || ' WHERE ' || where_clause || ';';
+  log(cascadelete_query);
+  do_dash(length(cascadelete_query));
+  recursive_delete(null, table_name, null, null, null, where_clause);
+  do_dash(length(cascadelete_query));
+end cascadelete;
 /
