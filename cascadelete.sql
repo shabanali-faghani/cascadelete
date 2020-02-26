@@ -99,7 +99,7 @@ create or replace procedure cascadelete(table_name varchar2, where_clause varcha
     counter       number(9);
     delete_query  varchar2(32767);
 
-  BEGIN
+  begin
     for child in childs(ancestor, parent) loop
       child_pk := primary_key(child.table_name);
       fk := child.foreign_key;
