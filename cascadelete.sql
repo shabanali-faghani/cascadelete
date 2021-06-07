@@ -29,13 +29,28 @@ create or replace procedure cascadelete(table_name varchar2, where_clause varcha
     exception when ex_custom then dbms_output.put_line(sqlerrm);
   end primary_key;
 
-  function number_of_records(table_name varchar2, column_name varchar2, parent_pk_values varchar2) return number is
+  procedure log(message CLOB) is
+    l_offset     INT := 1;  
+  begin
+    if logging then
+      loop  
+        exit when l_offset > dbms_lob.getlength(message);  
+        dbms_output.put_line( dbms_lob.substr( message, 255, l_offset ) );  
+        l_offset := l_offset + 255;  
+      end loop;
+    end if;
+  end log;
+
+  function number_of_records(table_name varchar2, column_name varchar2, parent_pk_values CLOB) return number is
     result var_table;
+    qry clob;
   begin
     if parent_pk_values is null then
       return 0;
     end if;
-    execute immediate 'SELECT count(1) FROM ' || table_name || ' WHERE ' || column_name || ' IN (' || parent_pk_values || ')' bulk collect into result;
+    qry := 'SELECT count(1) FROM ' || table_name || ' WHERE ' || column_name || ' IN (' || parent_pk_values || ')';
+    log('executing: ' || qry);
+    execute immediate qry bulk collect into result;
     return result(1);
   end number_of_records;
 
@@ -49,29 +64,24 @@ create or replace procedure cascadelete(table_name varchar2, where_clause varcha
     return result(1);
   end column_type;
 
-  function to_csv(list var_table, table_name varchar2, pk varchar2) return varchar2 is
+  function to_csv(list var_table, table_name varchar2, pk varchar2) return CLOB is
     column_data_type varchar2(10);
-    csv              varchar2(32767);
+    csv              CLOB;
     single_quote     char(1);
   begin
     column_data_type := column_type(table_name, pk);
-    if instr(upper(column_data_type), 'CHAR') <> 0 then -- CHAR, VARCHAR, VARCHAR2, NCHAR, NVARCHAR2
+    -- CHAR, VARCHAR, VARCHAR2, NCHAR, NVARCHAR2, RAW
+    if instr(upper(column_data_type), 'CHAR') <> 0 OR upper(column_data_type)='RAW' then 
       single_quote := '''';
     end if;
     for i in 1..list.count loop
-      csv := csv || single_quote || list(i) || single_quote || ', ';
+      csv := csv || single_quote || replace(list(i), '''', '''''') || single_quote || ', ';
     end loop;
+--    log('csv: ' || csv);
     return substr(csv, 1, length(csv) - 2);
   end to_csv;
 
-  procedure log(message varchar2) is
-  begin
-    if logging then
-      dbms_output.put_line(message);
-    end if;
-  end log;
-
-  procedure recursive_delete(ancestor varchar2, parent varchar2, pk varchar2, pk_values varchar2, indent varchar2,
+  procedure recursive_delete(ancestor varchar2, parent varchar2, pk varchar2, pk_values CLOB, indent varchar2,
     where_clause varchar2 default null) is
     cursor childs (ancestor varchar2, parent varchar2) is
       SELECT UC.CONSTRAINT_NAME, UC.TABLE_NAME, UCC.COLUMN_NAME AS FOREIGN_KEY
@@ -89,18 +99,19 @@ create or replace procedure cascadelete(table_name varchar2, where_clause varcha
       FROM DUAL
       WHERE ancestor IS NULL;
 
-    query         varchar2(32700);
+    query         CLOB;
     child_pk      varchar2(30);
     fk            varchar2(30);
-    wrapped_query varchar2(32767);
+    wrapped_query CLOB;
     result        var_table;
-    csv           varchar2(32767);
+    csv           CLOB;
     parts         number(9) := 0;
     counter       number(9);
-    delete_query  varchar2(32767);
+    delete_query  CLOB;
 
   begin
     for child in childs(ancestor, parent) loop
+      dbms_output.put_line('handling child: ' || child.table_name || ' by foreign key ' || child.FOREIGN_KEY); 
       child_pk := primary_key(child.table_name);
       fk := child.foreign_key;
       query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || child.foreign_key || ' IN (' || pk_values || ')';
@@ -108,13 +119,19 @@ create or replace procedure cascadelete(table_name varchar2, where_clause varcha
         query := 'SELECT ' || child_pk || ' FROM ' || child.table_name || ' WHERE ' || where_clause;
         fk := child_pk;
       end if;
-      wrapped_query := 'SELECT * FROM (' || query || ') WHERE ROWNUM <= ' || batch_size;
+      dbms_lob.createtemporary(wrapped_query, true);
+      dbms_lob.append(wrapped_query, 'SELECT * FROM (');
+      dbms_lob.append(wrapped_query, query);
+      dbms_lob.append(wrapped_query, ') WHERE ROWNUM <= ');
+      dbms_lob.append(wrapped_query, to_char(batch_size));
+      log(wrapped_query);
       execute immediate wrapped_query bulk collect into result;
       log(indent || '+- ' || case when ancestor is null then 'ROOT' else parent end || '  ->  ' || child.table_name);
       if result.count = 0 then
         continue;
       end if;
       log(indent || '*  sql> ' || query || ';');
+      dbms_lob.freetemporary(query);
       parts := ceil(number_of_records(child.table_name, fk, nvl(pk_values,
         to_csv(result, child.table_name, child_pk))) / batch_size);
       counter := 1;
@@ -125,11 +142,20 @@ create or replace procedure cascadelete(table_name varchar2, where_clause varcha
         execute immediate wrapped_query bulk collect into result;
         counter := counter + 1;
       end loop;
+      dbms_lob.freetemporary(wrapped_query);
     end loop;
     if ancestor is null then return; end if; -- ignore dummy root, there is nothing to delete
-    delete_query := 'DELETE ' || parent || ' WHERE ' || nvl(pk, child_pk) || ' IN (' || pk_values || ')';
+    dbms_lob.createtemporary(delete_query, true);
+    dbms_lob.append(delete_query, 'DELETE ');
+    dbms_lob.append(delete_query, parent);
+    dbms_lob.append(delete_query, ' WHERE ');
+    dbms_lob.append(delete_query, nvl(pk, child_pk));
+    dbms_lob.append(delete_query, ' IN (');
+    dbms_lob.append(delete_query, pk_values);
+    dbms_lob.append(delete_query, ')');
     log(substr(indent, 1, length(indent) - 5) || '*  sql> ' || delete_query || ';');
     execute immediate delete_query;
+    dbms_lob.freetemporary(delete_query);
   end recursive_delete;
 
   procedure do_dash(num number) is
